@@ -49,35 +49,9 @@ for r0_offset in tl.range(r0_numel_aligned, r0_numel, R0_BLOCK):
 
 Both loops update the **same accumulator variables** -- state carries across naturally.
 
-## 3. Interaction with xmask_unswitch
+## 3. Implementation Design
 
-When spatial masks (`xmask`) are also present (2D reductions with dynamic shapes), the main loop body still has `xmask`:
-
-```python
-# Main loop after peeling: r0_mask removed, xmask remains
-tmp0 = tl.load(ptr, xmask, other=0.0)
-_acc = tl.where(xmask, _acc + tmp0, _acc)
-```
-
-Now `xmask` is the **sole mask** -- exactly the condition where `xmask_unswitch` applies! So the two optimizations compose:
-
-```python
-# Main loop with peeling + xmask_unswitch:
-for r0_offset in tl.range(0, r0_numel_aligned, R0_BLOCK):
-    r0_index = r0_offset + r0_base
-    if xoffset + XBLOCK <= xnumel:
-        tmp0 = tl.load(ptr, None)          # fully vectorizable!
-        _acc = _acc + tmp0                  # no tl.where at all
-    else:
-        tmp0 = tl.load(ptr, xmask, other=0.0)
-        _acc = tl.where(xmask, _acc + tmp0, _acc)
-```
-
-This recovers full vectorization for reduction kernels with dynamic shapes, which neither optimization achieves alone.
-
-## 4. Implementation Design
-
-### 4.1 Files to Modify
+### 3.1 Files to Modify
 
 | File | Change |
 |------|--------|
@@ -86,7 +60,7 @@ This recovers full vectorization for reduction kernels with dynamic shapes, whic
 | `torch/_inductor/codegen/simd.py` | `_codegen_node_schedule_with_peeling` for dual buffer generation |
 | `test/inductor/test_codegen_triton.py` | Tests |
 
-### 4.2 Config Flag
+### 3.2 Config Flag
 
 ```python
 # torch/_inductor/config.py, in class triton:
@@ -98,7 +72,7 @@ loop_peeling: bool = False
 
 Disabled by default until broader validation is complete. Enable with `config.triton.loop_peeling = True` or the `@inductor_config.patch("triton.loop_peeling", True)` decorator in tests.
 
-### 4.3 Eligibility
+### 3.3 Eligibility
 
 New method `_should_peel_reduction_loop(self, loop_trees)` on `TritonKernel`:
 
@@ -119,7 +93,7 @@ Conditions explained:
 - **Mask not constant:** If `_has_constant_mask` is already True, there's no `r0_mask` to remove -- peeling is unnecessary.
 - **No block_ptr:** Block pointer reductions use `tl.advance()` and `boundary_check` instead of `r0_mask`. Peeling those requires modifying `boundary_check` lists. Deferred.
 
-### 4.4 Buffer Generation Strategy
+### 3.4 Buffer Generation Strategy
 
 The core challenge: `self.loads`, `self.compute`, `self.stores`, `self.indexing_code` are `IndentedBuffer` objects populated once (during node codegen in `codegen_node_schedule_with_kernel`) before `codegen_body()` is called. They contain baked-in mask expressions like `r0_mask & xmask` and `tl.where(r0_mask & xmask, ...)`. We need an unmasked copy for the main loop.
 
@@ -132,7 +106,7 @@ The core challenge: `self.loads`, `self.compute`, `self.stores`, `self.indexing_
 
 **Chosen: Approach B (dual generation).** The codegen already has a clean mechanism for mask elision: `filter_masks()` discards mask names where `_has_constant_mask()` returns True, causing `indexing()` to emit `None` masks and `reduction()` to emit bare accumulator updates (no `tl.where`). We add a flag to force this for the reduction tree, then run the buffer-filling codegen twice.
 
-### 4.5 Forcing Mask Elision
+### 3.5 Forcing Mask Elision
 
 New context manager on `TritonKernel`:
 
@@ -165,7 +139,7 @@ def _has_constant_mask(self, tree: IterationRangesRoot) -> bool:
 
 This is the **only string-level change** in the codegen: a 2-line early return. All downstream mask elision (in `filter_masks`, `indexing`, `reduction`) follows automatically through existing code paths.
 
-### 4.6 Dual Buffer Capture
+### 3.6 Dual Buffer Capture
 
 New method on `SIMDScheduling` that wraps the existing node codegen loop to produce two sets of buffers:
 
@@ -316,7 +290,7 @@ def _codegen_node_schedule_with_peeling(self, node_schedule, kernel):
 
 Without `swap_buffers`, `node.codegen()` would write into the kernel's real buffers, corrupting them. The scoped CSE is also critical — without it the unmasked pass would populate the CSE cache, and the subsequent masked pass would hit stale entries and skip code generation.
 
-### 4.7 Two-Loop Emission
+### 3.7 Two-Loop Emission
 
 New method `_codegen_peeled_reduction_loop(self, loop_trees)` on `TritonKernel`:
 
@@ -376,7 +350,7 @@ def _codegen_peeled_reduction_loop(self, loop_trees):
 - `unmasked['compute']` was generated with `r0_mask` discarded from the `masks` set in `reduction()` → `cond` was empty or `xmask`-only → `where_cond` returned `tval` directly (no `tl.where(r0_mask, ...)`).
 - `self.loads` / `self.compute` (masked) are the normal codegen output, used as-is for the tail loop.
 
-### 4.8 Fallback: Minimal String Replacement (not implemented)
+### 3.8 Fallback: Minimal String Replacement (not implemented)
 
 The dual-generation approach (Approach B) was successfully implemented. The CSE state save/restore + counter reset technique avoids the CSE side effects mentioned below. This fallback section is retained for reference only.
 
@@ -403,7 +377,7 @@ def _peel_rmask_from_line(line, rmask_name):
 | 4 | Standalone mask arg | `, r0_mask,` | `, None,` |
 | 5 | Dangling `other=` | `, None, other=0.0)` | `, None)` |
 
-### 4.9 Integration Points
+### 3.9 Integration Points
 
 **Two integration points** are needed:
 
@@ -436,7 +410,7 @@ elif self.inside_reduction and len(loop_trees) > 0:
 
 The presence of `_peeled_unmasked_bufs` (set by the dual-generation pass) is the signal to emit two loops instead of one. This avoids threading a flag through the call chain.
 
-## 5. Correctness by Reduction Type
+## 4. Correctness by Reduction Type
 
 All reduction types use the same `tl.where(cond, next_val, acc)` pattern for masked accumulator updates. With dual generation, the unmasked pass uses the same `reduction()` code path — it simply sees an empty `cond` (because `filter_masks` discarded `r0_mask`) and calls `where_cond(tval, fval)` which returns `tval` directly. No `tl.where` is emitted. This handles all reduction types uniformly:
 
@@ -449,7 +423,7 @@ All reduction types use the same `tl.where(cond, next_val, acc)` pattern for mas
 | online_softmax | Two accumulators (`max`, `sum`) | Same |
 | prod | `_acc = tl.where(r0_mask, _acc * val, _acc)` | `_acc = _acc * val` |
 
-## 6. Edge Cases
+## 5. Edge Cases
 
 | Case | Behavior |
 |------|----------|
@@ -461,7 +435,7 @@ All reduction types use the same `tl.where(cond, next_val, acc)` pattern for mas
 | Multi-dim reduction | Skipped (follow-up) |
 | Block pointer reductions | Skipped (follow-up) |
 
-## 7. Test Plan
+## 6. Test Plan
 
 Add `TestLoopPeeling(InductorTestCase)` in `test/inductor/test_codegen_triton.py`:
 
@@ -475,10 +449,40 @@ Add `TestLoopPeeling(InductorTestCase)` in `test/inductor/test_codegen_triton.py
 
 5. **`test_dynamic_shapes_peeling`** -- compile with `dynamic=True`, verify peeling triggers and produces correct results at three runtime sizes: non-aligned (1027), runtime-aligned (1024, tail runs 0 iterations), and small (3, main runs 0 iterations).
 
-## 8. Future Work
+## 7. Future Work
 
 1. **Block pointer reductions:** Modify `boundary_check` tuple; may need additional handling in `_force_constant_rmask` or a separate code path.
 2. **Cooperative reductions:** Compute `aligned` relative to `rsplit_start`/`rsplit_end`.
 3. **Multi-dim reductions:** Peel innermost loop only.
-4. **Compose with xmask_unswitch:** After peeling removes `r0_mask`, `xmask` becomes sole mask in main loop, enabling xmask_unswitch to remove it too for full vectorization on dynamic-shape 2D reductions.
-5. **Stride alignment for full vectorization:** Even with masks removed, dynamic strides (`ks0`) prevent pointer alignment proof. Dual-kernel dispatch (Option B) or `tl.assume` needed for the last mile.
+4. **Compose with xmask_unswitch for full mask removal:** After peeling removes `r0_mask`, the main loop body still has `xmask` (spatial mask) when shapes are dynamic:
+
+    ```python
+    # Main loop after peeling: r0_mask removed, xmask remains
+    tmp0 = tl.load(ptr, xmask, other=0.0)
+    _acc = tl.where(xmask, _acc + tmp0, _acc)
+    ```
+
+    Now `xmask` is the **sole mask** -- exactly the condition where `xmask_unswitch` applies. The two optimizations compose:
+
+    ```python
+    # Main loop with peeling + xmask_unswitch:
+    for r0_offset in tl.range(0, r0_numel_aligned, R0_BLOCK):
+        r0_index = r0_offset + r0_base
+        if xoffset + XBLOCK <= xnumel:
+            tmp0 = tl.load(ptr, None)          # mask=None -> vectorizable!
+            _acc = _acc + tmp0                  # no tl.where at all
+        else:
+            tmp0 = tl.load(ptr, xmask, other=0.0)
+            _acc = tl.where(xmask, _acc + tmp0, _acc)
+    ```
+
+    This recovers `mask=None` for the main loop body, which is a prerequisite for Triton to emit vectorized loads (`ld.global.v4`). Neither optimization achieves this alone for dynamic-shape 2D reductions.
+
+5. **Stride divisibility hint for vectorization:** Even with `mask=None`, Triton still needs to prove pointer alignment to emit vectorized loads. For dynamic shapes, the stride (e.g., `ks0` in `in_ptr0 + (r0_1 + ks0*x0)`) is not known at compile time. Without a `tl.assume(ks0 % 16 == 0)` or a divisibility hint in the kernel metadata (`'tt.divisibility': 16`), Triton falls back to scalar loads. Full vectorization requires both:
+    - **mask=None** (from peeling + xmask_unswitch) — tells Triton no lane is masked out
+    - **Pointer alignment proof** (from stride divisibility hints) — tells Triton the address is aligned for wide loads
+
+    Options for the stride hint:
+    - **`tl.assume`**: Emit `tl.assume(ks0 % 16 == 0)` at kernel entry. Requires runtime guard that the hint holds.
+    - **Dual-kernel dispatch**: Generate two kernel variants (aligned / unaligned) and dispatch based on runtime stride check.
+    - **Signature metadata**: Pass `ks0` with `'tt.divisibility': 16` in the Triton kernel metadata when the inductor can prove divisibility from symbolic constraints.
