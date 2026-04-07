@@ -1,8 +1,7 @@
 # Reduction Loop Peeling for TorchInductor Triton Codegen
 
 **Issue:** https://github.com/pytorch/pytorch/issues/148402
-**Status:** Design
-**Author:** Liqiang Lu
+
 
 ## 1. Problem
 
@@ -56,8 +55,9 @@ Both loops update the **same accumulator variables** -- state carries across nat
 | File | Change |
 |------|--------|
 | `torch/_inductor/config.py` | Add `triton.loop_peeling` config flag |
-| `torch/_inductor/codegen/triton.py` | Core: eligibility check, `_force_constant_rmask` context manager, `_has_constant_mask` 2-line addition, `_codegen_peeled_reduction_loop` emission |
-| `torch/_inductor/codegen/simd.py` | `_codegen_node_schedule_with_peeling` for dual buffer generation |
+| `torch/_inductor/codegen/common.py` | Base `Kernel.make_isolated_codegen_copy()` method for shallow-copying kernels with fresh mutable state |
+| `torch/_inductor/codegen/simd.py` | `SIMDKernel.make_isolated_codegen_copy()` override (adds `body`/`indexing_code` buffers), `_codegen_node_schedule_with_peeling` for dual buffer generation |
+| `torch/_inductor/codegen/triton.py` | `TritonKernel.make_isolated_codegen_copy()` override (adds block-ptr state, prologue, helper functions), eligibility check, `_force_constant_rmask` context manager, `_has_constant_mask` 2-line addition, `_codegen_peeled_reduction_loop` emission |
 | `test/inductor/test_codegen_triton.py` | Tests |
 
 ### 3.2 Config Flag
@@ -139,93 +139,129 @@ def _has_constant_mask(self, tree: IterationRangesRoot) -> bool:
 
 This is the **only string-level change** in the codegen: a 2-line early return. All downstream mask elision (in `filter_masks`, `indexing`, `reduction`) follows automatically through existing code paths.
 
-### 3.6 Dual Buffer Capture
+### 3.6 Kernel Cloning: `make_isolated_codegen_copy()`
 
-New method on `SIMDScheduling` that wraps the existing node codegen loop to produce two sets of buffers:
+Dual buffer generation (Section 3.7) needs to run the node codegen twice — once without `r0_mask`, once with. The unmasked pass must be fully isolated so its side effects (counter increments, buffer writes, CSE cache pollution) don't leak into the real kernel. Rather than manually saving/restoring every mutable field, we use a **three-level `make_isolated_codegen_copy()` method chain** that creates a shallow copy with fresh mutable state:
+
+**`Kernel.make_isolated_codegen_copy()`** (common.py) — base method:
+```python
+def make_isolated_codegen_copy(self) -> Self:
+    clone = copy.copy(self)
+    clone.exit_stack = contextlib.ExitStack()
+    clone.loads = IndentedBuffer()
+    clone.compute = IndentedBuffer()
+    clone.stores = IndentedBuffer()
+    clone.cse = self.cse.clone()
+    # Start counter from the same position so the clone generates
+    # the same variable names without advancing the real counter.
+    _current = next(self.cse.iter_buffer_ids)
+    self.cse.iter_buffer_ids = itertools.count(_current)
+    clone.cse.iter_buffer_ids = itertools.count(_current)
+    clone.must_keep_buffers = OrderedSet()
+    clone.store_buffer_names = OrderedSet()
+    return clone
+```
+
+**`SIMDKernel.make_isolated_codegen_copy()`** (simd.py) — adds SIMD-specific buffers:
+```python
+def make_isolated_codegen_copy(self):
+    clone = super().make_isolated_codegen_copy()
+    clone.body = IndentedBuffer()
+    clone.indexing_code = IndentedBuffer()
+    return clone
+```
+
+**`TritonKernel.make_isolated_codegen_copy()`** (triton.py) — adds Triton-specific state:
+```python
+def make_isolated_codegen_copy(self):
+    clone = super().make_isolated_codegen_copy()
+    clone.prologue = IndentedBuffer()
+    clone.prologue_cache = {}
+    clone.post_loop_combine = IndentedBuffer()
+    clone.post_loop_store = IndentedBuffer()
+    clone.outside_loop_vars = OrderedSet()
+    clone.autotune_hints = OrderedSet()
+    clone.helper_functions = HelperFunctions()
+    clone._load_counts = collections.Counter()
+    clone.stores_with_contiguous_rdim = []
+    return clone
+```
+
+| State type | Isolation mechanism |
+|-----------|-------------------|
+| Scalar counters (`num_load`, `num_store`, `num_reduction`, `atomic_add_found`) | Python rebind-on-assignment: `clone.num_load += 1` creates a new int on the clone, original unchanged |
+| `IndentedBuffer` fields (`body`, `loads`, `compute`, `prologue`, etc.) | Replaced with fresh instances across the three override levels |
+| Mutable sets (`autotune_hints`, `store_buffer_names`, `must_keep_buffers`, `outside_loop_vars`) | Replaced with fresh `OrderedSet()` |
+| CSE caches | `kernel.cse.clone()` creates a new CSE; counter starts from the same position via `itertools.count(_current)` |
+| `exit_stack` | Replaced with fresh `ExitStack()` so `with clone:` doesn't corrupt the original kernel's handler stack |
+| Block-pointer state (`block_ptr_id`, `block_ptr_to_buffer`, `pointer_advancements`) | Not reset — peeling is gated by `not self.pointer_advancements.get(...)`, so these are empty when the clone is created |
+| Read-only shared state (`range_trees`, `args`, `features`, `numels`) | Shared by reference — safe because codegen only reads these |
+
+**CSE counter sharing:** Both `self.cse.iter_buffer_ids` and `clone.cse.iter_buffer_ids` are set to `itertools.count(_current)` where `_current` is peeked from the original counter. This ensures both passes produce variable names starting from the same position. The original counter is also replaced (since `next()` consumed one value from it).
+
+### 3.7 Dual Buffer Capture
+
+New method on `SIMDScheduling` that runs the node codegen twice. The unmasked pass runs on a clone from `make_isolated_codegen_copy()`. When the schedule has multiple reduction segments (e.g. max, pointwise, sum), each segment gets its own set of unmasked buffers.
 
 ```python
 def _codegen_node_schedule_with_peeling(self, node_schedule, kernel):
-    """Run node codegen twice: once without r0_mask (main loop), once with (tail loop)."""
+    """Run node codegen twice to produce unmasked (main) and masked (tail) buffers."""
 
-    cse = kernel.cse
+    # First pass (unmasked) on an isolated copy
+    clone = kernel.make_isolated_codegen_copy()
 
-    # --- Save all mutable state before the unmasked pass ---
-    # The unmasked pass runs node.codegen() which writes to body (accumulator
-    # init), post_loop_combine (tl.sum), post_loop_store (tl.store), and
-    # mutates CSE caches, _load_counts, outside_loop_vars.  All must be
-    # restored so the masked pass produces identical variable names.
-    saved_body = kernel.body
-    saved_plc = kernel.post_loop_combine
-    saved_pls = kernel.post_loop_store
-    saved_lc = kernel._load_counts.copy()
-    saved_olv = kernel.outside_loop_vars.copy()
-    saved_cc = dict(cse._cache)
-    saved_rc = dict(cse.reduction_cache)
-    saved_sc = dict(cse.store_cache)
-    saved_vm = dict(cse.varname_map)
-    saved_is = cse.invalidated_stores.copy()
+    # One entry per reduction segment, consumed in order by codegen_body.
+    unmasked_bufs_list: list[dict[str, IndentedBuffer]] = []
 
-    # --- First pass: unmasked buffers (main loop body) ---
-    # Redirect body/post_loop to throwaway buffers so accumulator init
-    # and final reduction from the unmasked pass are discarded.
-    kernel.body = IndentedBuffer()
-    kernel.post_loop_combine = IndentedBuffer()
-    kernel.post_loop_store = IndentedBuffer()
+    with clone._force_constant_rmask():
+        with clone:  # sets V.ops and V.kernel to clone
+            inside = True
+            for node in node_schedule:
+                if node is DisableReduction:
+                    # End of a reduction segment — snapshot its buffers.
+                    unmasked_bufs_list.append({
+                        'indexing_code': clone.indexing_code,
+                        'loads': clone.loads,
+                        'compute': clone.compute,
+                        'stores': clone.stores,
+                    })
+                    # Reset for the next segment, mirroring the CSE
+                    # invalidation that codegen_body does between loops.
+                    clone.indexing_code = IndentedBuffer()
+                    clone.loads = IndentedBuffer()
+                    clone.compute = IndentedBuffer()
+                    clone.stores = IndentedBuffer()
+                    clone.cse.invalidate(clone.outside_loop_vars)
+                    for tree in clone.range_trees:
+                        tree.cache_clear()
+                    inside = False
+                elif node is EnableReduction:
+                    inside = True
+                elif inside:
+                    indexing_dtype_strength_reduction(node._body)
+                    index_vars = clone.split_and_set_ranges(node.get_ranges())
+                    node.codegen(index_vars)
 
-    unmasked_bufs = {
-        'indexing_code': IndentedBuffer(),
-        'loads': IndentedBuffer(),
-        'compute': IndentedBuffer(),
-        'stores': IndentedBuffer(),
-    }
-    with kernel._force_constant_rmask():
-        with kernel.swap_buffers(unmasked_bufs['loads'],
-                                 unmasked_bufs['compute'],
-                                 unmasked_bufs['stores']):
-            # swap_buffers only redirects loads/compute/stores.
-            # indexing_code must be swapped manually.
-            # TODO: extend swap_buffers to accept indexing_code.
-            old_indexing = kernel.indexing_code
-            kernel.indexing_code = unmasked_bufs['indexing_code']
-            try:
-                # Only process nodes inside the reduction loop.
-                # Skip DisableReduction/EnableReduction and any nodes
-                # between them (non-reduction nodes like stores).
-                inside = True
-                for node in node_schedule:
-                    if node is DisableReduction:
-                        inside = False
-                    elif node is EnableReduction:
-                        inside = True
-                    elif inside:
-                        indexing_dtype_strength_reduction(node._body)
-                        index_vars = kernel.split_and_set_ranges(node.get_ranges())
-                        node.codegen(index_vars)
-            finally:
-                kernel.indexing_code = old_indexing
+    # Capture trailing reduction segment (no final DisableReduction).
+    unmasked_bufs_list.append({
+        'indexing_code': clone.indexing_code,
+        'loads': clone.loads,
+        'compute': clone.compute,
+        'stores': clone.stores,
+    })
 
-    # --- Restore all state ---
-    # Reset CSE counter to 0 so the masked pass produces the same
-    # variable names (tmp0, tmp1, _tmp2, ...) as the unmasked pass.
-    # Both passes must share accumulator names for correctness.
-    kernel.body = saved_body
-    kernel.post_loop_combine = saved_plc
-    kernel.post_loop_store = saved_pls
-    kernel._load_counts = saved_lc
-    kernel.outside_loop_vars = saved_olv
-    cse._cache = saved_cc
-    cse.reduction_cache = saved_rc
-    cse.store_cache = saved_sc
-    cse.varname_map = saved_vm
-    cse.invalidated_stores = saved_is
-    cse.iter_buffer_ids = itertools.count(0)
+    # Clear range tree caches populated by the clone pass so the
+    # real kernel's second pass recomputes them.
     for tree in kernel.range_trees:
         tree.cache_clear()
 
-    # --- Second pass: masked buffers (tail loop body) ---
-    # Normal codegen — fills kernel.loads/compute/stores (tail loop body),
-    # kernel.body (accumulator init), kernel.post_loop_combine (tl.sum),
-    # and kernel.post_loop_store (tl.store).
+    # Set unmasked buffers BEFORE the masked pass.  The masked pass may
+    # hit DisableReduction which calls kernel.disable_reduction() ->
+    # kernel.codegen_body(), flushing the reduction loop.  codegen_body
+    # pops from this list to get the matching segment's unmasked buffers.
+    kernel._peeled_unmasked_bufs_list = unmasked_bufs_list
+
+    # --- Second pass (masked) on the real kernel: normal codegen ---
     stack = contextlib.ExitStack()
     for node in node_schedule:
         if node is DisableReduction:
@@ -236,61 +272,49 @@ def _codegen_node_schedule_with_peeling(self, node_schedule, kernel):
             indexing_dtype_strength_reduction(node._body)
             index_vars = kernel.split_and_set_ranges(node.get_ranges())
             node.codegen(index_vars)
-
-    # Store unmasked buffers on kernel for codegen_body to use
-    kernel._peeled_unmasked_bufs = unmasked_bufs
 ```
 
-**CSE counter reset:** Both passes must produce the same variable names (`tmp0`, `_tmp2`, etc.) so the unmasked loop body references the same accumulators as the masked pass. We reset `iter_buffer_ids` to `count(0)` before the masked pass. This works because `finalize_indexing` (which runs before both passes) does not allocate `tmpN` variables — the first `tmpN` comes from `node.codegen()`.
+**Why `make_isolated_codegen_copy()` instead of save/restore?** `node.codegen()` dispatches through `CSEProxy` which increments `kernel.num_load`, `kernel.num_store`, `kernel.num_reduction`, and kernel methods may set `atomic_add_found` or add to `autotune_hints`, `store_buffer_names`, `must_keep_buffers`. Manually saving/restoring every mutable field is fragile — it's easy to miss one and get double-counted metadata. The three-level copy chain isolates all of these automatically.
 
-**Why save/restore body, post_loop_combine, post_loop_store?** The unmasked pass's `node.codegen()` calls `reduction()`, which writes accumulator init to `self.body`, final reduction to `self.post_loop_combine`, and output store to `self.post_loop_store`. These side effects must be discarded — only the masked (second) pass should produce the real accumulator lifecycle. We redirect them to throwaway buffers during the unmasked pass, then restore the originals.
+**Multi-segment handling:** A fused kernel like `max(x) + sum(x)` has a `node_schedule` like `[max_reduction, DisableReduction, pointwise, EnableReduction, sum_reduction]`. Each `DisableReduction` boundary snapshots the current clone buffers into `unmasked_bufs_list` and resets the clone's buffers for the next segment. The trailing segment (after the last `EnableReduction`) is captured after the loop. During the masked pass, `kernel.disable_reduction()` triggers `codegen_body()`, which pops from `_peeled_unmasked_bufs_list` to get the matching segment's unmasked buffers.
+
+**Why `with clone:`?** `node.codegen()` replays the LoopBody FX graph through `V.ops` / `V.kernel`. These are set by `Kernel.__enter__` (called by `with clone:`). Without it, `V.ops` would be a `MockHandler` and codegen would produce no output.
 
 **Why skip non-reduction nodes in the first pass?** Fused kernels like `sum(x) + 1.0` have a `node_schedule` containing `[reduction_node, DisableReduction, pointwise_node, EnableReduction]`. The pointwise node has `ranges=((N,), ())` — no reduction dimension. Processing it with `inside_reduction=True` would fail in `split_and_set_ranges`. We only need the reduction loop body for the unmasked pass, so we skip nodes outside `DisableReduction`/`EnableReduction` boundaries.
 
-**Why `swap_buffers` for indexing_code too?** `swap_buffers` only redirects `loads`, `compute`, `stores`. `indexing_code` needs manual save/restore (as shown above). An alternative is to add `indexing_code` support to `swap_buffers`, but manual handling keeps the change minimal.
+**How the clone fills the unmasked buffers:**
 
-**How `swap_buffers` fills the unmasked buffers:**
-
-`node.codegen()` replays the LoopBody FX graph. Each op dispatches to `TritonKernel` methods that write into `self.loads`, `self.compute`, `self.stores`. `swap_buffers` redirects these to our empty `unmasked_bufs`, so the same codegen machinery fills different targets:
+`node.codegen()` replays the LoopBody FX graph. Each op dispatches to `TritonKernel` methods that write into `self.loads`, `self.compute`, `self.stores`. Since `V.kernel` points to the clone, all writes go to the clone's fresh buffers:
 
 ```
-1. Create four empty IndentedBuffers (unmasked_bufs)
+1. clone has fresh empty IndentedBuffers for all code sections
 
-2. swap_buffers redirects:
-     self.loads   -> unmasked_bufs['loads']
-     self.compute -> unmasked_bufs['compute']
-     self.stores  -> unmasked_bufs['stores']
-   Also: self.cse = cse.scoped_copy()  (isolated cache)
+2. _force_constant_rmask makes filter_masks() drop r0_mask
 
-3. _force_constant_rmask makes filter_masks() drop r0_mask
+3. with clone: sets V.ops = CSEProxy(clone, TritonOverrides)
+               sets V.kernel = clone
 
-4. node.codegen() runs, dispatching through V.ops -> TritonKernel:
+4. node.codegen() runs, dispatching through V.ops -> clone (as TritonKernel):
 
-     ops.load(...)  ->  TritonKernel.load()
-        -> self.indexing() sees no r0_mask (forced constant)
+     ops.load(...)  ->  clone.load()
+        -> clone.indexing() sees no r0_mask (forced constant)
         -> emits "tl.load(ptr, xmask, ...)"  (no r0_mask!)
-        -> cse.generate(self.loads, expr)
-                        ^^^^^^^^^^
-                        this IS unmasked_bufs['loads'] (swapped)
-        -> writes: "tmp0 = tl.load(ptr, xmask, ...)" into it
+        -> clone.cse.generate(clone.loads, expr) -> writes to clone.loads
 
-     ops.reduction(...)  ->  TritonKernel.reduction()
+     ops.reduction(...)  ->  clone.reduction()
         -> filter_masks returns masks={xmask}  (r0_mask dropped!)
         -> cond = "xmask"  (not "r0_mask & xmask")
-        -> self.compute.writeline("_tmp2 = tl.where(xmask, tmp3, _tmp2)")
-           ^^^^^^^^^^^^
-           this IS unmasked_bufs['compute'] (swapped)
+        -> clone.compute.writeline("_tmp2 = tl.where(xmask, tmp3, _tmp2)")
 
-5. swap_buffers exits:
-     self.loads/compute/stores restored to kernel's originals
-     self.cse restored to parent CSE
+5. At DisableReduction: snapshot clone's buffers, reset for next segment
 
-6. unmasked_bufs now contain the mask-elided loop body code
+6. with clone: exits, V.ops/V.kernel restored to previous values
+
+7. unmasked_bufs_list contains one entry per reduction segment
+   clone is discarded; only the list is kept
 ```
 
-Without `swap_buffers`, `node.codegen()` would write into the kernel's real buffers, corrupting them. The scoped CSE is also critical — without it the unmasked pass would populate the CSE cache, and the subsequent masked pass would hit stale entries and skip code generation.
-
-### 3.7 Two-Loop Emission
+### 3.8 Two-Loop Emission
 
 New method `_codegen_peeled_reduction_loop(self, loop_trees)` on `TritonKernel`:
 
@@ -298,7 +322,7 @@ New method `_codegen_peeled_reduction_loop(self, loop_trees)` on `TritonKernel`:
 def _codegen_peeled_reduction_loop(self, loop_trees):
     tree = loop_trees[0]
     prefix = tree.prefix                    # "r0"
-    unmasked = self._peeled_unmasked_bufs   # set by _codegen_node_schedule_with_peeling
+    unmasked = self._peeled_unmasked_bufs_list.pop(0)  # consume next segment
 
     numel_var = f"{prefix}numel"            # "r0numel"
     block_var = f"{prefix.upper()}BLOCK"    # "R0BLOCK"
@@ -350,7 +374,7 @@ def _codegen_peeled_reduction_loop(self, loop_trees):
 - `unmasked['compute']` was generated with `r0_mask` discarded from the `masks` set in `reduction()` → `cond` was empty or `xmask`-only → `where_cond` returned `tval` directly (no `tl.where(r0_mask, ...)`).
 - `self.loads` / `self.compute` (masked) are the normal codegen output, used as-is for the tail loop.
 
-### 3.8 Fallback: Minimal String Replacement (not implemented)
+### 3.9 Fallback: Minimal String Replacement (not implemented)
 
 The dual-generation approach (Approach B) was successfully implemented. The CSE state save/restore + counter reset technique avoids the CSE side effects mentioned below. This fallback section is retained for reference only.
 
@@ -377,7 +401,7 @@ def _peel_rmask_from_line(line, rmask_name):
 | 4 | Standalone mask arg | `, r0_mask,` | `, None,` |
 | 5 | Dangling `other=` | `, None, other=0.0)` | `, None)` |
 
-### 3.9 Integration Points
+### 3.10 Integration Points
 
 **Two integration points** are needed:
 
@@ -397,18 +421,22 @@ def codegen_node_schedule_with_kernel(self, node_schedule, kernel):
             # ... existing second pass (normal codegen) unchanged ...
 ```
 
-**2. Loop emission** — in `TritonKernel.codegen_body()` (triton.py:5201):
+**2. Loop emission** — in `TritonKernel.codegen_body()` (triton.py:5262):
 
 ```python
 elif self.inside_reduction and len(loop_trees) > 0:
-    if hasattr(self, '_peeled_unmasked_bufs'):
+    if (
+        hasattr(self, '_peeled_unmasked_bufs_list')
+        and self._peeled_unmasked_bufs_list
+        and not self.pointer_advancements.get(loop_trees[0].symt)
+    ):
         self._codegen_peeled_reduction_loop(loop_trees)
     else:
         # Original single-loop path (unchanged)
         ...
 ```
 
-The presence of `_peeled_unmasked_bufs` (set by the dual-generation pass) is the signal to emit two loops instead of one. This avoids threading a flag through the call chain.
+The presence of `_peeled_unmasked_bufs_list` (set by the dual-generation pass) is the signal to emit two loops instead of one. The additional guard on `pointer_advancements` ensures block-pointer reductions fall back to the original single-loop path, since peeled loops don't emit `tl.advance()`. This avoids threading a flag through the call chain.
 
 ## 4. Correctness by Reduction Type
 
@@ -437,17 +465,17 @@ All reduction types use the same `tl.where(cond, next_val, acc)` pattern for mas
 
 ## 6. Test Plan
 
-Add `TestLoopPeeling(InductorTestCase)` in `test/inductor/test_codegen_triton.py`:
+Add `TestLoopPeeling(InductorTestCase)` in `test/inductor/test_codegen_triton.py`. All tests use a shared `_check_peeling` helper that compiles the function, asserts `r0_numel_aligned` appears in the generated code (proving peeling triggered), and checks numerical correctness against eager execution.
 
-1. **`test_reduction_generates_peeled_loop`** -- compile `torch.sum(x, dim=-1)` with non-aligned rnumel, verify generated code contains `r0_numel_aligned` and two `tl.range` loops, first loop lacks `r0_mask`.
+1. **`test_inner_reduction`** -- `torch.sum(x, dim=-1)` with shape `(32, 1027)` (non-aligned rnumel). Verifies basic peeling for inner-dim reduction.
 
-2. **`test_reduction_peeling_correctness_{sum,max,var}`** -- numerical correctness for sum, max, var (welford) with `rnumel=1027` (non-aligned).
+2. **`test_outer_reduction`** -- `torch.sum(x, dim=0)` with shape `(1027, 32)`. Verifies peeling works for outer-dim reductions.
 
-3. **`test_static_aligned_no_peeling`** -- `rnumel` known multiple of `R0_BLOCK` -> no peeling (no `r0_numel_aligned` in output).
+3. **`test_two_inner_reductions`** -- `max(x, dim=-1, keepdim=True)` followed by `sum(x - a, dim=-1)` with shape `(32, 1027)`. Tests multi-segment reduction in a single kernel: the schedule has two reduction segments separated by `DisableReduction`/`EnableReduction`, each getting its own entry in `_peeled_unmasked_bufs_list`.
 
-4. **`test_disabled_no_peeling`** -- `config.triton.loop_peeling = False` -> no peeling regardless of shape.
+4. **`test_one_inner_one_outer_reduction`** -- `sum(x, dim=-1)` and `sum(x, dim=0)` on the same input with shape `(32, 1027)`. Tests peeling when inner and outer reductions coexist.
 
-5. **`test_dynamic_shapes_peeling`** -- compile with `dynamic=True`, verify peeling triggers and produces correct results at three runtime sizes: non-aligned (1027), runtime-aligned (1024, tail runs 0 iterations), and small (3, main runs 0 iterations).
+5. **`test_combo_kernel_two_reductions`** -- Two separate `sum(dim=-1)` reductions on different inputs `(32, 1027)` and `(64, 1027)` with `combo_kernels=True`. Tests peeling interacts correctly with combo kernel fusion.
 
 ## 7. Future Work
 
